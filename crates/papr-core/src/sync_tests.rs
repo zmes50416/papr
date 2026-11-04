@@ -672,3 +672,108 @@ async fn pending_article_missing_remotely_is_retained_without_guessing_an_id() {
     assert!(flags(&db).await.contains(&(aid, false, true)));
     srv.finish().await;
 }
+
+#[tokio::test]
+async fn failed_unmapped_lookup_does_not_block_known_pushes_or_other_state_pulls() {
+    for lookup_failure in ["limit", "http", "malformed"] {
+        for fail_known_push in [false, true] {
+            let events = Arc::new(StdMutex::new(Vec::<String>::new()));
+            let recorded = events.clone();
+            let srv = server(move |req| {
+                if let Some(reply) = common(&req) { return reply; }
+                if req.path.ends_with("/edit-tag") {
+                    assert_eq!(req.param("i"), Some("tag:google.com,2005:reader/item/000000000000002a"));
+                    recorded.lock().unwrap().push("push-known".into());
+                    return if fail_known_push { (503, "unavailable".into()) } else { ok("OK") };
+                }
+                if req.path.ends_with("/items/ids") {
+                    if req.param("s") == Some(READING_LIST) && req.param("xt").is_none() {
+                        recorded.lock().unwrap().push("lookup-unmapped".into());
+                        return match lookup_failure {
+                            "http" => (503, "unavailable".into()),
+                            "malformed" => ok("[]"),
+                            "limit" => {
+                                let offset = req.param("c").unwrap_or("0").parse::<usize>().unwrap();
+                                // A complete 30,000 references with more history
+                                // remaining: discovery must not apply partial IDs.
+                                ok(serde_json::json!({
+                                    "itemRefs": (offset+100..offset+1100).map(|id| serde_json::json!({"id":id.to_string()})).collect::<Vec<_>>(),
+                                    "continuation": (offset+1000).to_string()
+                                }).to_string())
+                            },
+                            _ => unreachable!(),
+                        };
+                    }
+                    recorded.lock().unwrap().push("pull-state".into());
+                    let mut ids = vec![serde_json::json!({"id":"44"})];
+                    if fail_known_push { ids.push(serde_json::json!({"id":"42"})); }
+                    return ok(serde_json::json!({"itemRefs":ids}).to_string());
+                }
+                assert!(req.path.ends_with("/items/contents"));
+                let ids = req.params.iter().filter(|(k,_)| k == "i")
+                    .map(|(_,id)| item(miniflux_content_id(id).unwrap())).collect::<Vec<_>>();
+                ok(serde_json::json!({"items":ids}).to_string())
+            }).await;
+            let db = fixture_db(&srv.base, Provider::Miniflux).await;
+            let unresolved = ingest_new_article(&db, 43).await;
+            let pulled = ingest_new_article(&db, 44).await;
+            {
+                let conn = db.lock().await;
+                db::set_remote_id(&conn, 1, "tag:google.com,2005:reader/item/000000000000002a")
+                    .unwrap();
+                db::set_read(&conn, 1, true).unwrap();
+                db::set_starred(&conn, 1, false).unwrap();
+                db::enqueue_sync(&conn, 1, "read", true).unwrap();
+                db::enqueue_sync(&conn, 1, "starred", false).unwrap();
+                db::set_starred(&conn, unresolved, true).unwrap();
+                db::enqueue_sync(&conn, unresolved, "starred", true).unwrap();
+            }
+            sync_now(&db, &http()).await.unwrap();
+            let events = events.lock().unwrap();
+            assert_eq!(&events[..2], &["push-known", "push-known"]);
+            assert_eq!(events[2], "lookup-unmapped");
+            assert_eq!(
+                events.iter().filter(|event| *event == "push-known").count(),
+                2
+            );
+            assert!(events.iter().any(|event| event == "pull-state"));
+            drop(events);
+            let expected: std::collections::HashSet<_> = if fail_known_push {
+                [1, unresolved].into_iter().collect()
+            } else {
+                [unresolved].into_iter().collect()
+            };
+            assert_eq!(
+                db::pending_sync_article_ids(&*db.lock().await)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>(),
+                expected
+            );
+            let states = flags(&db).await;
+            assert!(
+                states.contains(&(1, true, false)),
+                "known edit must remain local even if its push failed"
+            );
+            assert!(
+                states.contains(&(unresolved, false, true)),
+                "unresolved edit must remain pending and intact"
+            );
+            assert!(
+                states.contains(&(pulled, false, true)),
+                "unrelated state pulls must still reconcile"
+            );
+            let id: Option<String> = db
+                .lock()
+                .await
+                .query_row(
+                    "SELECT remote_id FROM articles WHERE id=?1",
+                    [unresolved],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(id, None);
+            srv.finish().await;
+        }
+    }
+}

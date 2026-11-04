@@ -42,14 +42,19 @@ starred article is absent from Papr until Papr's own RSS ingestion creates the
 local article; the next state sync then applies its star. There is no claim of a
 complete server-side starred archive in Papr.
 
-For Miniflux, pending local edits with no remote ID trigger a bounded scan of the
-unfiltered reading list before the push. This resolves IDs for existing local
+For Miniflux, edits with known remote IDs are pushed first. Pending local edits
+with no remote ID then trigger a bounded scan of the unfiltered reading list;
+newly resolved edits are pushed in the same run. This resolves IDs for existing local
 articles that were already read/unstarred on the server before their first sync,
 and for user edits made immediately after RSS ingestion. It does not insert
 remote history into the local database. If a URL is absent remotely, the edit stays
-queued; no ID is guessed. This on-demand mapping may be expensive on large accounts
-and fails closed if the complete reading list exceeds the same 30-page safety
-limit. FreshRSS retains its existing mapping behavior. General queue crash
+queued; no ID is guessed. This on-demand mapping may be expensive on large accounts.
+If it exceeds the 30-page safety limit, returns an HTTP error, or supplies an
+invalid/incomplete response, no partial IDs are applied: unresolved edits stay
+queued, a warning is logged, and normal unread/starred reconciliation for other
+articles continues. Successful known-ID pushes stay acknowledged; failed known-ID
+pushes are requeued and protected too. SQLite failures still abort the run.
+FreshRSS retains its existing mapping behavior. General queue crash
 recovery and overlapping sync runs are separate pre-existing concerns.
 
 Protocol references checked directly against Miniflux 2.3.5:
@@ -71,7 +76,10 @@ items, remote-only historical stars, unresolved remote URLs, 16-digit decimal
 references, and changing membership during offset pagination. Every fixture task
 is explicitly joined, and its drop guard rejects forgotten joins; a deliberately
 panicking fixture verifies that a server assertion cannot pass as an expected
-client-side network error.
+client-side network error. A six-case matrix also verifies that a 30,000-item
+lookup with more history, an unavailable lookup, and a malformed lookup each leave
+unmapped edits intact while known-ID pushes (successful or failed) are handled
+first and unrelated article states still reconcile.
 
 ```sh
 cargo test --workspace --locked
@@ -79,8 +87,8 @@ pnpm build
 pnpm test
 ```
 
-Verified locally on Apple Silicon macOS: 276 Rust tests passed (30 desktop,
-13 CLI, 233 core), 76 frontend tests passed, and `pnpm build` succeeded. The
+Verified locally on Apple Silicon macOS: 277 Rust tests passed (30 desktop,
+13 CLI, 234 core), 76 frontend tests passed, and `pnpm build` succeeded. The
 existing upstream CI only runs desktop-package tests. Changing it to
 `cargo test --workspace --locked` requires GitHub OAuth `workflow` scope, which
 the current login lacks; [`ci-workspace-tests.patch`](ci-workspace-tests.patch)

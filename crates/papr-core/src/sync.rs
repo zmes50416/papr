@@ -497,7 +497,11 @@ async fn fetch_miniflux_items(
 
 /// Resolve pending local edits that predate their first unread/starred match.
 /// This maps IDs for existing local articles only; it does not import history.
-async fn resolve_pending_miniflux_ids(db: &Db, session: &Session, http: &Client) -> AppResult<()> {
+async fn resolve_pending_miniflux_ids(
+    db: &Db,
+    session: &Session,
+    http: &Client,
+) -> AppResult<usize> {
     let pending_urls: std::collections::HashSet<String> = {
         let conn = db.lock().await;
         let mut statement = conn.prepare(
@@ -510,18 +514,20 @@ async fn resolve_pending_miniflux_ids(db: &Db, session: &Session, http: &Client)
         urls
     };
     if pending_urls.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let items = fetch_miniflux_items(session, http, READING_LIST, None).await?;
     let conn = db.lock().await;
+    let mut mapped = 0;
     for item in items {
         if pending_urls.contains(&item.url) {
             if let Some(aid) = db::article_id_by_url(&conn, &item.url)? {
                 db::set_remote_id(&conn, aid, &item.id)?;
+                mapped += 1;
             }
         }
     }
-    Ok(())
+    Ok(mapped)
 }
 
 /// Fetch a complete unread/starred set, or fail before the destructive sweep.
@@ -572,29 +578,9 @@ async fn fetch_stream_items(
     Ok(out)
 }
 
-/// Push queued changes, then pull subscriptions and read/starred state.
-/// Returns the number of local articles whose state was reconciled.
-pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
-    let creds = creds(db)
-        .await?
-        .ok_or_else(|| AppError::code("freshrssNotConnected"))?;
-    let base = greader_base(&creds.url, creds.provider);
-    let session = match &creds.auth {
-        Some(auth) => session_with_token(http, &base, auth.clone()).await?,
-        None => {
-            // Legacy install: exchange the plaintext password for a token,
-            // then migrate so the password is no longer kept on disk.
-            let pass = creds.legacy_pass.as_deref().unwrap_or_default();
-            let session = login(http, &base, &creds.user, pass).await?;
-            persist_session(db, &creds.url, &creds.user, &session.auth, creds.provider).await?;
-            session
-        }
-    };
-
-    if matches!(creds.provider, Provider::Miniflux) {
-        resolve_pending_miniflux_ids(db, &session, http).await?;
-    }
-
+/// Flush addressable edits. Unmapped edits stay queued; failed pushes are
+/// requeued before any subsequent pull can reconcile their local state.
+async fn push_sync_queue(db: &Db, session: &Session, http: &Client) -> AppResult<()> {
     // 1 ── push: flush queued local read/starred changes. `take_sync_queue`
     // removes the rows up front, so any push that fails must be re-queued —
     // otherwise a network blip silently drops the user's change forever.
@@ -637,6 +623,46 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
         let conn = db.lock().await;
         for entry in &failed {
             db::requeue_sync(&conn, entry.article_id, &entry.field, entry.value)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Push queued changes, then pull subscriptions and read/starred state.
+/// Returns the number of local articles whose state was reconciled.
+pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
+    let creds = creds(db)
+        .await?
+        .ok_or_else(|| AppError::code("freshrssNotConnected"))?;
+    let base = greader_base(&creds.url, creds.provider);
+    let session = match &creds.auth {
+        Some(auth) => session_with_token(http, &base, auth.clone()).await?,
+        None => {
+            // Legacy install: exchange the plaintext password for a token,
+            // then migrate so the password is no longer kept on disk.
+            let pass = creds.legacy_pass.as_deref().unwrap_or_default();
+            let session = login(http, &base, &creds.user, pass).await?;
+            persist_session(db, &creds.url, &creds.user, &session.auth, creds.provider).await?;
+            session
+        }
+    };
+
+    // Push known IDs first: an expensive/failed lookup must not hold them up.
+    push_sync_queue(db, &session, http).await?;
+    if matches!(creds.provider, Provider::Miniflux) {
+        match resolve_pending_miniflux_ids(db, &session, http).await {
+            Ok(mapped) if mapped > 0 => push_sync_queue(db, &session, http).await?,
+            Ok(_) => {}
+            Err(AppError::Db(error)) => return Err(AppError::Db(error)),
+            Err(error) => {
+                // Optional ID discovery is not an authoritative state set. A
+                // failure leaves the unresolved queue intact and must not stop
+                // normal unread/starred synchronization for other articles.
+                log::warn!(
+                    "sync: remote ID lookup failed; unmapped local edits remain queued: {error}"
+                );
+            }
         }
     }
 
