@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Papr Miniflux Test",
+  "identifier": "com.zmes50416.papr.miniflux-test",
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["papr-miniflux-test"]
+      }
+    },
+    "updater": {
+      "endpoints": []
+    }
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}

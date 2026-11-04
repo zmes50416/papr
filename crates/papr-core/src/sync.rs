@@ -1,9 +1,9 @@
 //! Synchronisation over the Google Reader compatible API.
 //!
 //! Supports any GReader-compatible backend; today FreshRSS and Miniflux.
-//! Protocol is identical (`ClientLogin`, `reader/api/0/edit-tag`,
-//! `stream/contents/...`, `com.google/*` tags) — only the API root path
-//! differs per provider, so the `Provider` enum centralises that mapping.
+//! Authentication and edits use the same protocol; stream retrieval differs.
+//! Miniflux requires `stream/items/ids` followed by `stream/items/contents`,
+//! while FreshRSS supports `stream/contents/...`.
 //!
 //! Flow: `ClientLogin` for an auth token, push any queued local read/starred
 //! changes via `edit-tag`, pull the subscription list (to subscribe locally to
@@ -29,10 +29,8 @@ const READ_TAG: &str = "user/-/state/com.google/read";
 const STARRED_TAG: &str = "user/-/state/com.google/starred";
 const READING_LIST: &str = "user/-/state/com.google/reading-list";
 
-/// Which GReader-compatible backend the user is connected to. The wire
-/// protocol is identical; only where the API root sits under the server URL
-/// differs (FreshRSS mounts it at `/api/greader.php`, Miniflux serves it at
-/// the server root).
+/// Which GReader-compatible backend the user is connected to. This selects
+/// both the API root and the supported stream retrieval protocol.
 #[derive(Clone, Copy)]
 enum Provider {
     FreshRss,
@@ -146,7 +144,6 @@ async fn login(http: &Client, base: &str, user: &str, pass: &str) -> AppResult<S
 
 #[derive(Deserialize)]
 struct SubList {
-    #[serde(default)]
     subscriptions: Vec<Sub>,
 }
 #[derive(Deserialize)]
@@ -192,7 +189,6 @@ impl SubCat {
 
 #[derive(Deserialize)]
 struct Contents {
-    #[serde(default)]
     items: Vec<Item>,
     // Present when the stream has more pages; fed back as `c=` to page on.
     #[serde(default)]
@@ -233,19 +229,25 @@ async fn creds(db: &Db) -> AppResult<Option<Creds>> {
     let nonempty = |k| db::get_setting(&conn, k).map(|v| v.filter(|s| !s.is_empty()));
     let auth = nonempty("freshrss_auth")?;
     let legacy_pass = nonempty("freshrss_pass")?;
-    let provider = Provider::from_setting(
-        db::get_setting(&conn, "freshrss_provider")?.as_deref(),
-    );
+    let provider = Provider::from_setting(db::get_setting(&conn, "freshrss_provider")?.as_deref());
     if url.trim().is_empty() || user.is_empty() || (auth.is_none() && legacy_pass.is_none()) {
         return Ok(None);
     }
-    Ok(Some(Creds { url, user, auth, legacy_pass, provider }))
+    Ok(Some(Creds {
+        url,
+        user,
+        auth,
+        legacy_pass,
+        provider,
+    }))
 }
 
 /// The configured GReader server URL and provider, or `None` when not
 /// connected.
 pub async fn connected_url(db: &Db) -> AppResult<Option<(String, String)>> {
-    Ok(creds(db).await?.map(|c| (c.url, c.provider.as_str().to_string())))
+    Ok(creds(db)
+        .await?
+        .map(|c| (c.url, c.provider.as_str().to_string())))
 }
 
 /// Persist a verified connection, storing the auth token and never the
@@ -327,52 +329,195 @@ struct RemoteItem {
     url: String,
 }
 
-/// Fetch every item of a GReader stream, following `continuation` pages. `xt`,
-/// when set, is an "exclude tag" filter (e.g. exclude read to get only unread).
-///
-/// Paging is capped: the sets we fetch this way (unread, starred) are bounded by
-/// what the user hasn't yet read/has starred — normally a few hundred items — so
-/// `MAX_PAGES` pages of `n=1000` (tens of thousands of items) is a generous
-/// ceiling that also stops a pathological server from looping us forever.
-async fn fetch_stream_items(
+// Limits bound network work, never the authoritative set: hitting a limit
+// with more pages is an error, so no partial result reaches reconciliation.
+const STREAM_PAGE_SIZE: usize = 1000;
+const MAX_STREAM_PAGES: usize = 30;
+const CONTENT_BATCH_SIZE: usize = 100;
+
+fn incomplete_stream() -> AppError {
+    AppError::other(
+        "Sync response was invalid or incomplete; local read/starred state was preserved",
+    )
+}
+
+/// Serde also accepts positional arrays for derived structs. Require an
+/// object at the HTTP boundary so `[[]]` cannot masquerade as an empty stream.
+async fn sync_json<T: serde::de::DeserializeOwned>(request: RequestBuilder) -> AppResult<T> {
+    let value: serde_json::Value = request.send().await?.error_for_status()?.json().await?;
+    if !value.is_object() {
+        return Err(incomplete_stream());
+    }
+    serde_json::from_value(value).map_err(|_| incomplete_stream())
+}
+
+impl TryFrom<Item> for RemoteItem {
+    type Error = AppError;
+
+    fn try_from(item: Item) -> AppResult<Self> {
+        let url = item
+            .canonical
+            .iter()
+            .chain(item.alternate.iter())
+            .map(|h| h.href.as_str())
+            .find(|url| !url.trim().is_empty())
+            .ok_or_else(incomplete_stream)?;
+        if item.id.trim().is_empty() {
+            return Err(incomplete_stream());
+        }
+        Ok(Self {
+            id: item.id,
+            url: url.to_string(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ItemRefs {
+    // Required: `{}`, `[]` and null are not an authoritative empty set.
+    #[serde(rename = "itemRefs")]
+    items: Vec<ItemRef>,
+    continuation: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ItemRef {
+    id: String,
+}
+
+/// Miniflux lists decimal IDs but returns prefixed hexadecimal content IDs.
+fn miniflux_content_id(id: &str) -> AppResult<u64> {
+    let id = id
+        .strip_prefix("tag:google.com,2005:reader/item/")
+        .ok_or_else(incomplete_stream)?;
+    u64::from_str_radix(id, 16)
+        .ok()
+        .filter(|id| *id > 0 && *id <= i64::MAX as u64)
+        .ok_or_else(incomplete_stream)
+}
+
+async fn fetch_miniflux_items(
     session: &Session,
     http: &Client,
     stream: &str,
     xt: Option<&str>,
 ) -> AppResult<Vec<RemoteItem>> {
-    const PAGE: &str = "1000";
-    const MAX_PAGES: usize = 30;
+    use std::collections::HashSet;
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut continuation: Option<String> = None;
+    for page_index in 0..MAX_STREAM_PAGES {
+        let mut params = vec![
+            ("output", "json".to_string()),
+            ("s", stream.to_string()),
+            ("n", STREAM_PAGE_SIZE.to_string()),
+        ];
+        if let Some(xt) = xt {
+            params.push(("xt", xt.to_string()));
+        }
+        if let Some(c) = &continuation {
+            params.push(("c", c.clone()));
+        }
+        let page: ItemRefs =
+            sync_json(session.get(http, "stream/items/ids").query(&params)).await?;
+        if page.items.len() > STREAM_PAGE_SIZE {
+            return Err(incomplete_stream());
+        }
+        let empty = page.items.is_empty();
+        for item in page.items {
+            let id = item
+                .id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0 && *id <= i64::MAX as u64)
+                .ok_or_else(incomplete_stream)?;
+            if !seen.insert(id) {
+                return Err(incomplete_stream());
+            }
+            // Store the exact decimal reference for POST i=, without confusing
+            // decimal references with the hexadecimal IDs returned in contents.
+            ids.push(item.id);
+        }
+        match page.continuation {
+            None => break,
+            Some(c) => {
+                // Miniflux's continuation is the next offset, not an opaque
+                // token. Reject skipped pages, repeated pages and stalled scans.
+                if empty
+                    || c.parse::<usize>().ok() != Some(ids.len())
+                    || page_index + 1 == MAX_STREAM_PAGES
+                {
+                    return Err(incomplete_stream());
+                }
+                continuation = Some(c);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(ids.len());
+    for batch in ids.chunks(CONTENT_BATCH_SIZE) {
+        let mut params = vec![("output", "json"), ("T", session.token.as_str())];
+        params.extend(batch.iter().map(|id| ("i", id.as_str())));
+        let page: Contents =
+            sync_json(session.post(http, "stream/items/contents").form(&params)).await?;
+        // Every requested reference must resolve exactly once. A deleted item,
+        // capped batch or malformed result requires a retry of the whole sync.
+        if page.continuation.is_some() || page.items.len() != batch.len() {
+            return Err(incomplete_stream());
+        }
+        let mut expected: HashSet<u64> = batch.iter().map(|id| id.parse().unwrap()).collect();
+        for item in page.items {
+            if !expected.remove(&miniflux_content_id(&item.id)?) {
+                return Err(incomplete_stream());
+            }
+            out.push(item.try_into()?);
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch a complete unread/starred set, or fail before the destructive sweep.
+async fn fetch_stream_items(
+    session: &Session,
+    http: &Client,
+    provider: Provider,
+    stream: &str,
+    xt: Option<&str>,
+) -> AppResult<Vec<RemoteItem>> {
+    if matches!(provider, Provider::Miniflux) {
+        return fetch_miniflux_items(session, http, stream, xt).await;
+    }
     let path = format!("stream/contents/{stream}");
     let mut out = Vec::new();
     let mut cont: Option<String> = None;
-    for _ in 0..MAX_PAGES {
-        let mut params: Vec<(&str, &str)> = vec![("output", "json"), ("n", PAGE)];
+    let mut seen_tokens = std::collections::HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for page_index in 0..MAX_STREAM_PAGES {
+        let mut params = vec![
+            ("output", "json".to_string()),
+            ("n", STREAM_PAGE_SIZE.to_string()),
+        ];
         if let Some(xt) = xt {
-            params.push(("xt", xt));
+            params.push(("xt", xt.to_string()));
         }
-        if let Some(c) = cont.as_deref() {
-            params.push(("c", c));
+        if let Some(c) = &cont {
+            params.push(("c", c.clone()));
         }
-        let page: Contents = session
-            .get(http, &path)
-            .query(&params)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let page: Contents = sync_json(session.get(http, &path).query(&params)).await?;
+        let empty = page.items.is_empty();
         for item in page.items {
-            if let Some(url) = item
-                .canonical
-                .first()
-                .or_else(|| item.alternate.first())
-                .map(|h| h.href.clone())
-            {
-                out.push(RemoteItem { id: item.id, url });
+            if !seen_ids.insert(item.id.clone()) {
+                return Err(incomplete_stream());
             }
+            out.push(item.try_into()?);
         }
         match page.continuation {
-            Some(c) if !c.is_empty() => cont = Some(c),
+            Some(c) if !c.is_empty() => {
+                if empty || !seen_tokens.insert(c.clone()) || page_index + 1 == MAX_STREAM_PAGES {
+                    return Err(incomplete_stream());
+                }
+                cont = Some(c);
+            }
             _ => break,
         }
     }
@@ -422,8 +567,15 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
             ])
             .send()
             .await
-            .and_then(|r| r.error_for_status())
-            .is_ok();
+            .and_then(|r| r.error_for_status());
+        let pushed = match pushed {
+            Ok(response) => response
+                .text()
+                .await
+                .map(|body| body.trim() == "OK")
+                .unwrap_or(false),
+            Err(_) => false,
+        };
         if !pushed {
             failed.push(entry);
         }
@@ -432,18 +584,12 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
         log::warn!("sync: {} change(s) failed to push, re-queued", failed.len());
         let conn = db.lock().await;
         for entry in &failed {
-            let _ = db::requeue_sync(&conn, entry.article_id, &entry.field, entry.value);
+            db::requeue_sync(&conn, entry.article_id, &entry.field, entry.value)?;
         }
     }
 
     // 2 ── pull subscriptions: subscribe locally to any feed we don't have.
-    let subs: SubList = session
-        .get(http, "subscription/list?output=json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let subs: SubList = sync_json(session.get(http, "subscription/list?output=json")).await?;
     let server_urls: std::collections::HashSet<String> = subs
         .subscriptions
         .iter()
@@ -518,8 +664,9 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
     // synced article read. This is what a pure GReader client effectively does,
     // and it fixes the runaway unread counts of issue #96 where the old
     // "reconcile the most recent 1000 items" pass never reached the long tail.
-    let unread = fetch_stream_items(&session, http, READING_LIST, Some(READ_TAG)).await?;
-    let starred = fetch_stream_items(&session, http, STARRED_TAG, None).await?;
+    let unread =
+        fetch_stream_items(&session, http, creds.provider, READING_LIST, Some(READ_TAG)).await?;
+    let starred = fetch_stream_items(&session, http, creds.provider, STARRED_TAG, None).await?;
 
     let unread_urls: std::collections::HashSet<String> =
         unread.iter().map(|i| i.url.clone()).collect();
@@ -560,7 +707,9 @@ mod tests {
     #[test]
     fn folder_name_prefers_label() {
         assert_eq!(
-            cat("user/-/label/Tech", Some("Tech")).folder_name().as_deref(),
+            cat("user/-/label/Tech", Some("Tech"))
+                .folder_name()
+                .as_deref(),
             Some("Tech")
         );
     }
@@ -577,7 +726,10 @@ mod tests {
     #[test]
     fn folder_name_skips_unnamed_categories() {
         // A state tag (not a label) or a blank label is not a folder.
-        assert_eq!(cat("user/-/state/com.google/read", None).folder_name(), None);
+        assert_eq!(
+            cat("user/-/state/com.google/read", None).folder_name(),
+            None
+        );
         assert_eq!(cat("", Some("   ")).folder_name(), None);
     }
 
@@ -615,3 +767,7 @@ mod tests {
         assert!(feeds_to_push(&local, &server).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "sync_tests.rs"]
+mod protocol_tests;
