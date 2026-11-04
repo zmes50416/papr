@@ -396,15 +396,14 @@ fn miniflux_content_id(id: &str) -> AppResult<u64> {
         .ok_or_else(incomplete_stream)
 }
 
-async fn fetch_miniflux_items(
+async fn fetch_miniflux_ids(
     session: &Session,
     http: &Client,
     stream: &str,
     xt: Option<&str>,
-) -> AppResult<Vec<RemoteItem>> {
-    use std::collections::HashSet;
+) -> AppResult<Vec<u64>> {
     let mut ids = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut continuation: Option<String> = None;
     for page_index in 0..MAX_STREAM_PAGES {
         let mut params = vec![
@@ -434,9 +433,7 @@ async fn fetch_miniflux_items(
             if !seen.insert(id) {
                 return Err(incomplete_stream());
             }
-            // Store the exact decimal reference for POST i=, without confusing
-            // decimal references with the hexadecimal IDs returned in contents.
-            ids.push(item.id);
+            ids.push(id);
         }
         match page.continuation {
             None => break,
@@ -454,10 +451,27 @@ async fn fetch_miniflux_items(
         }
     }
 
+    Ok(ids)
+}
+
+async fn fetch_miniflux_items(
+    session: &Session,
+    http: &Client,
+    stream: &str,
+    xt: Option<&str>,
+) -> AppResult<Vec<RemoteItem>> {
+    use std::collections::HashSet;
+    let ids = fetch_miniflux_ids(session, http, stream, xt).await?;
     let mut out = Vec::with_capacity(ids.len());
     for batch in ids.chunks(CONTENT_BATCH_SIZE) {
-        let mut params = vec![("output", "json"), ("T", session.token.as_str())];
-        params.extend(batch.iter().map(|id| ("i", id.as_str())));
+        let mut params = vec![("output", "json".to_string()), ("T", session.token.clone())];
+        // Miniflux interprets bare 16-character IDs as hex even when the IDs
+        // endpoint emitted decimal. Always send the unambiguous long form.
+        params.extend(
+            batch
+                .iter()
+                .map(|id| ("i", format!("tag:google.com,2005:reader/item/{id:016x}"))),
+        );
         let page: Contents =
             sync_json(session.post(http, "stream/items/contents").form(&params)).await?;
         // Every requested reference must resolve exactly once. A deleted item,
@@ -465,7 +479,7 @@ async fn fetch_miniflux_items(
         if page.continuation.is_some() || page.items.len() != batch.len() {
             return Err(incomplete_stream());
         }
-        let mut expected: HashSet<u64> = batch.iter().map(|id| id.parse().unwrap()).collect();
+        let mut expected: HashSet<u64> = batch.iter().copied().collect();
         for item in page.items {
             if !expected.remove(&miniflux_content_id(&item.id)?) {
                 return Err(incomplete_stream());
@@ -473,7 +487,41 @@ async fn fetch_miniflux_items(
             out.push(item.try_into()?);
         }
     }
+    let confirmed = fetch_miniflux_ids(session, http, stream, xt).await?;
+    if ids.iter().copied().collect::<HashSet<_>>() != confirmed.into_iter().collect::<HashSet<_>>()
+    {
+        return Err(incomplete_stream());
+    }
     Ok(out)
+}
+
+/// Resolve pending local edits that predate their first unread/starred match.
+/// This maps IDs for existing local articles only; it does not import history.
+async fn resolve_pending_miniflux_ids(db: &Db, session: &Session, http: &Client) -> AppResult<()> {
+    let pending_urls: std::collections::HashSet<String> = {
+        let conn = db.lock().await;
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT a.url FROM sync_queue q JOIN articles a ON a.id=q.article_id
+             WHERE a.remote_id IS NULL AND a.url IS NOT NULL",
+        )?;
+        let urls = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        urls
+    };
+    if pending_urls.is_empty() {
+        return Ok(());
+    }
+    let items = fetch_miniflux_items(session, http, READING_LIST, None).await?;
+    let conn = db.lock().await;
+    for item in items {
+        if pending_urls.contains(&item.url) {
+            if let Some(aid) = db::article_id_by_url(&conn, &item.url)? {
+                db::set_remote_id(&conn, aid, &item.id)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fetch a complete unread/starred set, or fail before the destructive sweep.
@@ -542,6 +590,10 @@ pub async fn sync_now(db: &Db, http: &Client) -> AppResult<usize> {
             session
         }
     };
+
+    if matches!(creds.provider, Provider::Miniflux) {
+        resolve_pending_miniflux_ids(db, &session, http).await?;
+    }
 
     // 1 ── push: flush queued local read/starred changes. `take_sync_queue`
     // removes the rows up front, so any push that fails must be re-queued —

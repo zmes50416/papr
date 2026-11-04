@@ -10,8 +10,10 @@ Miniflux 2.3.5 implements `GET stream/items/ids` and
 `POST stream/items/contents`, rather than FreshRSS's `GET stream/contents`.
 The Miniflux provider now enumerates unread and starred references using
 continuation offsets, then resolves them in batches of 100 with repeated `i`
-form fields. Decimal reference IDs are checked against the hexadecimal item IDs
-in the returned content; the content's long-form ID is stored for `edit-tag`.
+form fields. Decimal reference IDs are converted to unambiguous prefixed
+hexadecimal IDs for the contents request (Miniflux otherwise interprets bare
+16-character decimal IDs as hex). The returned IDs must match the requested
+references; the content's long-form ID is stored for `edit-tag`.
 FreshRSS continues using its existing endpoint.
 
 Both complete sets must be available before read/starred reconciliation starts.
@@ -26,15 +28,29 @@ The safety bounds are 30 ID pages of 1000 references per set and batches of 100
 contents. The limit is an error when another page remains, never permission to
 apply a partial set. The API has no snapshot token or total-count field: a
 server that silently omits data and continuation while returning an otherwise
-valid response cannot be distinguished from a complete set. Concurrent server
-changes can also affect offset pagination. This patch does not claim stronger
-snapshot guarantees than the protocol supplies.
+valid response cannot be distinguished from a complete set. After resolving
+contents, the client repeats each complete ID scan and rejects changed membership,
+including offset shifts that silently skip an item in the first scan. This is
+optimistic validation, not an atomic snapshot: concurrent changes after the check,
+or changes that produce the same omissions in both scans, remain possible. Keep
+other clients idle during validation; this patch does not claim atomic snapshot
+guarantees that the protocol does not supply.
 
-Existing scope is retained: articles are matched by URL; only articles in
-server-known feeds are swept. Historical read/unstarred articles without a
-remote ID continue waiting for a matching unread/starred pull before queued
-edits can be sent. General queue crash recovery and overlapping sync runs are
-separate pre-existing concerns.
+Articles are matched by URL; only articles in server-known feeds are swept.
+**This is state reconciliation, not historical article import.** A remote-only
+starred article is absent from Papr until Papr's own RSS ingestion creates the
+local article; the next state sync then applies its star. There is no claim of a
+complete server-side starred archive in Papr.
+
+For Miniflux, pending local edits with no remote ID trigger a bounded scan of the
+unfiltered reading list before the push. This resolves IDs for existing local
+articles that were already read/unstarred on the server before their first sync,
+and for user edits made immediately after RSS ingestion. It does not insert
+remote history into the local database. If a URL is absent remotely, the edit stays
+queued; no ID is guessed. This on-demand mapping may be expensive on large accounts
+and fails closed if the complete reading list exceeds the same 30-page safety
+limit. FreshRSS retains its existing mapping behavior. General queue crash
+recovery and overlapping sync runs are separate pre-existing concerns.
 
 Protocol references checked directly against Miniflux 2.3.5:
 
@@ -49,7 +65,13 @@ No production Miniflux requests, Papr database access or real credentials are
 needed. They cover ID pagination, 100-item batching, reordered results, decimal
 versus hexadecimal ID mapping, all four read/star add/remove edits, server-side
 changes, explicit empty sets, local-only feed protection, failed pushes/retries,
-malformed/incomplete replies and FreshRSS regression scenarios.
+malformed/incomplete replies and FreshRSS regression scenarios. Added cases cover
+new RSS ingestion, edits before the first state sync, newly ingested read/unstarred
+items, remote-only historical stars, unresolved remote URLs, 16-digit decimal
+references, and changing membership during offset pagination. Every fixture task
+is explicitly joined, and its drop guard rejects forgotten joins; a deliberately
+panicking fixture verifies that a server assertion cannot pass as an expected
+client-side network error.
 
 ```sh
 cargo test --workspace --locked
@@ -57,12 +79,12 @@ pnpm build
 pnpm test
 ```
 
-Verified locally on Apple Silicon macOS: 269 Rust tests passed (30 desktop,
-13 CLI, 226 core), 76 frontend tests passed, and `pnpm build` succeeded. The
+Verified locally on Apple Silicon macOS: 276 Rust tests passed (30 desktop,
+13 CLI, 233 core), 76 frontend tests passed, and `pnpm build` succeeded. The
 existing upstream CI only runs desktop-package tests. Changing it to
 `cargo test --workspace --locked` requires GitHub OAuth `workflow` scope, which
-the current login lacks; the separate `ci-workspace-tests.patch` deliverable
-contains that change. Run the workspace command above locally until the
+the current login lacks; [`ci-workspace-tests.patch`](ci-workspace-tests.patch)
+contains that change and is included as a separate local deliverable. Run the workspace command above locally until the
 workflow patch can be applied. The isolated `.app` was built and its ad-hoc code signature
 verified; it has not been launched or connected to production.
 

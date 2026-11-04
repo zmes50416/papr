@@ -19,10 +19,25 @@ impl Request {
 struct Server {
     base: String,
     task: tokio::task::JoinHandle<()>,
+    checked: bool,
+}
+impl Server {
+    async fn finish(mut self) {
+        self.task.abort();
+        let result = (&mut self.task).await;
+        self.checked = true;
+        if let Err(error) = result {
+            assert!(error.is_cancelled(), "fixture server panicked: {error}");
+        }
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
+        assert!(
+            self.checked || std::thread::panicking(),
+            "fixture task must be joined with finish()"
+        );
     }
 }
 async fn server(handler: impl Fn(Request) -> (u16, String) + Send + Sync + 'static) -> Server {
@@ -75,7 +90,11 @@ async fn server(handler: impl Fn(Request) -> (u16, String) + Send + Sync + 'stat
             socket.write_all(response.as_bytes()).await.unwrap();
         }
     });
-    Server { base, task }
+    Server {
+        base,
+        task,
+        checked: false,
+    }
 }
 fn ok(body: impl Into<String>) -> (u16, String) {
     (200, body.into())
@@ -150,7 +169,7 @@ async fn miniflux_pages_ids_and_batches_contents_with_normalized_ids() {
         assert!(req.path.ends_with("/items/contents"));
         assert_eq!(req.method, "POST");
         assert_eq!(req.param("T"), Some("write-fixture"));
-        let ids: Vec<u64> = req.params.iter().filter(|(k,_)| k == "i").map(|(_,v)| v.parse().unwrap()).collect();
+        let ids: Vec<u64> = req.params.iter().filter(|(k,_)| k == "i").map(|(_,v)| miniflux_content_id(v).unwrap()).collect();
         assert!(ids.len() == 100 || ids.len() == 2);
         // The server need not preserve the request order.
         ok(serde_json::json!({"items": ids.into_iter().rev().map(item).collect::<Vec<_>>()}).to_string())
@@ -168,6 +187,7 @@ async fn miniflux_pages_ids_and_batches_contents_with_normalized_ids() {
     assert!(result
         .iter()
         .any(|i| i.url == "https://example.com/42" && i.id.ends_with("000000000000002a")));
+    srv.finish().await;
 }
 
 #[tokio::test]
@@ -241,6 +261,7 @@ async fn invalid_or_incomplete_miniflux_sync_preserves_both_states() {
         let before = flags(&db).await;
         assert!(sync_now(&db, &http()).await.is_err(), "accepted {scenario}");
         assert_eq!(flags(&db).await, before, "changed state for {scenario}");
+        srv.finish().await;
     }
 }
 
@@ -276,7 +297,7 @@ async fn miniflux_bidirectional_read_and_star_edits_and_failed_push_retry() {
             let include = if req.param("s") == Some(STARRED_TAG) {
                 state.1
             } else {
-                !state.0
+                req.param("xt").is_none() || !state.0
             };
             return ok(if include {
                 r#"{"itemRefs":[{"id":"42"}]}"#
@@ -330,6 +351,7 @@ async fn miniflux_bidirectional_read_and_star_edits_and_failed_push_retry() {
     assert!(db::pending_sync_article_ids(&*db.lock().await)
         .unwrap()
         .is_empty());
+    srv.finish().await;
 }
 
 #[tokio::test]
@@ -378,5 +400,275 @@ async fn freshrss_pages_work_and_incomplete_pages_fail_closed() {
             assert!(result.is_err(), "accepted {scenario}");
             assert_eq!(flags(&db).await, before);
         }
+        srv.finish().await;
     }
+}
+
+/// Model a fresh RSS ingestion into Papr's own database, without fetching a feed.
+async fn ingest_new_article(db: &Db, id: u64) -> i64 {
+    let conn = db.lock().await;
+    let url = format!("https://example.com/{id}");
+    let article = crate::db::NewArticle {
+        guid: format!("new-{id}"),
+        url: Some(url.clone()),
+        title: "New synthetic article".into(),
+        author: None,
+        summary: None,
+        content_html: None,
+        body_text: String::new(),
+        image_url: None,
+        published_at: None,
+        enclosures: Vec::new(),
+    };
+    db::upsert_article(&conn, 1, &article, false, &[]).unwrap();
+    db::article_id_by_url(&conn, &url).unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn newly_ingested_unread_article_maps_and_pushes_early_edits() {
+    let remote = Arc::new(StdMutex::new((false, false)));
+    let state = remote.clone();
+    let srv = server(move |req| {
+        if let Some(reply) = common(&req) {
+            return reply;
+        }
+        let mut state = state.lock().unwrap();
+        if req.path.ends_with("/edit-tag") {
+            assert_eq!(
+                req.param("i"),
+                Some("tag:google.com,2005:reader/item/000000000000002b")
+            );
+            let add = req.param("a");
+            match add.or(req.param("r")).unwrap() {
+                READ_TAG => state.0 = add.is_some(),
+                STARRED_TAG => state.1 = add.is_some(),
+                _ => panic!("unexpected edit"),
+            }
+            return ok("OK");
+        }
+        if req.path.ends_with("/items/ids") {
+            let include = if req.param("s") == Some(STARRED_TAG) {
+                state.1
+            } else {
+                req.param("xt").is_none() || !state.0
+            };
+            return ok(if include {
+                r#"{"itemRefs":[{"id":"43"}]}"#
+            } else {
+                r#"{"itemRefs":[]}"#
+            });
+        }
+        assert!(req.path.ends_with("/items/contents"));
+        ok(serde_json::json!({"items":[item(43)]}).to_string())
+    })
+    .await;
+    let db = fixture_db(&srv.base, Provider::Miniflux).await;
+    // The remote has the article before Papr ingests it; state sync does not import it.
+    sync_now(&db, &http()).await.unwrap();
+    assert_eq!(flags(&db).await.len(), 2);
+    let aid = ingest_new_article(&db, 43).await;
+    // User edits it before its first sync, while it has no remote ID yet.
+    {
+        let conn = db.lock().await;
+        db::set_read(&conn, aid, true).unwrap();
+        db::set_starred(&conn, aid, true).unwrap();
+        db::enqueue_sync(&conn, aid, "read", true).unwrap();
+        db::enqueue_sync(&conn, aid, "starred", true).unwrap();
+    }
+    sync_now(&db, &http()).await.unwrap(); // resolve ID before pushing the early edit
+    assert_eq!(*remote.lock().unwrap(), (true, true));
+    assert!(db::pending_sync_article_ids(&*db.lock().await)
+        .unwrap()
+        .is_empty());
+    *remote.lock().unwrap() = (false, false); // another client changes both flags
+    sync_now(&db, &http()).await.unwrap();
+    assert!(flags(&db).await.contains(&(aid, false, false)));
+    srv.finish().await;
+}
+
+#[tokio::test]
+async fn remote_only_starred_article_is_not_imported_by_state_reconciliation() {
+    let srv = server(|req| {
+        if let Some(reply) = common(&req) {
+            return reply;
+        }
+        if req.path.ends_with("/items/ids") {
+            return ok(if req.param("s") == Some(STARRED_TAG) {
+                r#"{"itemRefs":[{"id":"43"}]}"#
+            } else {
+                r#"{"itemRefs":[]}"#
+            });
+        }
+        assert!(req.path.ends_with("/items/contents"));
+        ok(serde_json::json!({"items":[item(43)]}).to_string())
+    })
+    .await;
+    let db = fixture_db(&srv.base, Provider::Miniflux).await;
+    sync_now(&db, &http()).await.unwrap();
+    assert_eq!(
+        db::article_id_by_url(&*db.lock().await, "https://example.com/43").unwrap(),
+        None
+    );
+    // If RSS later provides the article, its star state is then reconciled.
+    let aid = ingest_new_article(&db, 43).await;
+    sync_now(&db, &http()).await.unwrap();
+    assert!(flags(&db).await.contains(&(aid, true, true)));
+    srv.finish().await;
+}
+
+#[tokio::test]
+async fn new_read_unstarred_article_resolves_pending_id_and_pushes() {
+    let remote = Arc::new(StdMutex::new((true, false)));
+    let state = remote.clone();
+    let srv = server(move |req| {
+        if let Some(reply) = common(&req) {
+            return reply;
+        }
+        let mut state = state.lock().unwrap();
+        if req.path.ends_with("/edit-tag") {
+            assert_eq!(
+                req.param("i"),
+                Some("tag:google.com,2005:reader/item/000000000000002b")
+            );
+            let add = req.param("a");
+            match add.or(req.param("r")).unwrap() {
+                READ_TAG => state.0 = add.is_some(),
+                STARRED_TAG => state.1 = add.is_some(),
+                _ => panic!("unexpected edit"),
+            }
+            return ok("OK");
+        }
+        if req.path.ends_with("/items/ids") {
+            let include = if req.param("s") == Some(STARRED_TAG) {
+                state.1
+            } else {
+                req.param("xt").is_none() || !state.0
+            };
+            return ok(if include {
+                r#"{"itemRefs":[{"id":"43"}]}"#
+            } else {
+                r#"{"itemRefs":[]}"#
+            });
+        }
+        assert!(req.path.ends_with("/items/contents"));
+        ok(serde_json::json!({"items":[item(43)]}).to_string())
+    })
+    .await;
+    let db = fixture_db(&srv.base, Provider::Miniflux).await;
+    let aid = ingest_new_article(&db, 43).await;
+    sync_now(&db, &http()).await.unwrap();
+    assert!(flags(&db).await.contains(&(aid, true, false)));
+    {
+        let conn = db.lock().await;
+        db::set_read(&conn, aid, false).unwrap();
+        db::set_starred(&conn, aid, true).unwrap();
+        db::enqueue_sync(&conn, aid, "read", false).unwrap();
+        db::enqueue_sync(&conn, aid, "starred", true).unwrap();
+    }
+    sync_now(&db, &http()).await.unwrap();
+    assert_eq!(*remote.lock().unwrap(), (false, true));
+    assert!(flags(&db).await.contains(&(aid, false, true)));
+    assert!(db::pending_sync_article_ids(&*db.lock().await)
+        .unwrap()
+        .is_empty());
+    srv.finish().await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "fixture server panicked")]
+async fn fixture_task_panic_cannot_count_as_an_expected_sync_error() {
+    let srv = server(|_| panic!("deliberate fixture assertion failure")).await;
+    // A negative test might accept this transport error. Joining the task must
+    // still fail the test instead of silently swallowing the server's panic.
+    let _ = session(&srv.base).get(&http(), "fixture").send().await;
+    srv.finish().await;
+}
+
+#[tokio::test]
+async fn sixteen_digit_decimal_reference_is_posted_as_long_form_hex() {
+    const ID: u64 = 1_234_567_890_123_456;
+    let srv = server(|req| {
+        if req.path.ends_with("/items/ids") {
+            return ok(serde_json::json!({"itemRefs":[{"id": ID.to_string()}]}).to_string());
+        }
+        assert!(req.path.ends_with("/items/contents"));
+        let sent = req.param("i").unwrap();
+        assert_eq!(sent, format!("tag:google.com,2005:reader/item/{ID:016x}"));
+        assert_eq!(miniflux_content_id(sent).unwrap(), ID);
+        // A bare 16-digit decimal string would be interpreted by Miniflux as
+        // hexadecimal and point at a different (or nonexistent) article.
+        assert_ne!(u64::from_str_radix(&ID.to_string(), 16).unwrap(), ID);
+        ok(serde_json::json!({"items":[item(ID)]}).to_string())
+    })
+    .await;
+    let items = fetch_miniflux_items(&session(&srv.base), &http(), READING_LIST, None)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].url, format!("https://example.com/{ID}"));
+    srv.finish().await;
+}
+
+#[tokio::test]
+async fn changed_membership_during_offset_pagination_aborts_state_sweep() {
+    let scans = Arc::new(StdMutex::new(0));
+    let state = scans.clone();
+    let srv = server(move |req| {
+        if let Some(reply) = common(&req) {
+            return reply;
+        }
+        if req.path.ends_with("/items/ids") {
+            assert_eq!(req.param("s"), Some(READING_LIST));
+            if req.param("c") == Some("1") {
+                // Item 42 was read between requests. Item 43 shifted to offset
+                // zero, so requesting offset one misses it without an error.
+                return ok(r#"{"itemRefs":[]}"#);
+            }
+            let mut scans = state.lock().unwrap();
+            *scans += 1;
+            return if *scans == 1 {
+                ok(r#"{"itemRefs":[{"id":"42"}],"continuation":"1"}"#)
+            } else {
+                ok(r#"{"itemRefs":[{"id":"43"}]}"#)
+            };
+        }
+        assert!(req.path.ends_with("/items/contents"));
+        ok(serde_json::json!({"items":[item(42)]}).to_string())
+    })
+    .await;
+    let db = fixture_db(&srv.base, Provider::Miniflux).await;
+    let before = flags(&db).await;
+    assert!(sync_now(&db, &http()).await.is_err());
+    assert_eq!(flags(&db).await, before);
+    assert_eq!(*scans.lock().unwrap(), 2);
+    srv.finish().await;
+}
+
+#[tokio::test]
+async fn pending_article_missing_remotely_is_retained_without_guessing_an_id() {
+    let srv = server(|req| {
+        if let Some(reply) = common(&req) {
+            return reply;
+        }
+        assert!(
+            req.path.ends_with("/items/ids"),
+            "unresolved ID must not be pushed"
+        );
+        ok(r#"{"itemRefs":[]}"#)
+    })
+    .await;
+    let db = fixture_db(&srv.base, Provider::Miniflux).await;
+    let aid = ingest_new_article(&db, 43).await;
+    {
+        let conn = db.lock().await;
+        db::set_starred(&conn, aid, true).unwrap();
+        db::enqueue_sync(&conn, aid, "starred", true).unwrap();
+    }
+    sync_now(&db, &http()).await.unwrap();
+    assert_eq!(
+        db::pending_sync_article_ids(&*db.lock().await).unwrap(),
+        vec![aid]
+    );
+    assert!(flags(&db).await.contains(&(aid, false, true)));
+    srv.finish().await;
 }
